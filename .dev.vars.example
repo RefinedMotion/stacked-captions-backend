@@ -1,0 +1,24 @@
+# Copy this file to ".dev.vars" (no .example) and fill in real values.
+# .dev.vars is gitignored and only loaded by `wrangler dev` for local testing.
+# For production deploy, use `wrangler secret put NAME` instead.
+
+# HMAC secret for signing activation tokens. ~64+ random chars.
+# Generate one with PowerShell:
+#   -join ((1..64) | ForEach-Object { [char](Get-Random -Min 33 -Max 126) })
+TOKEN_SECRET=replace-me-with-a-long-random-string-at-least-32-chars
+
+# Protects /v1/admin/* endpoints. Same idea — long random string.
+ADMIN_TOKEN=replace-me-with-another-long-random-string
+
+# Your Anthropic API key. Will be used by the /v1/ai-apply proxy.
+ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxxxxxxx
+
+# Fine-grained GitHub PAT (read-only Contents) on
+# RefinedMotion/stacked-captions. Used by /v1/check-update +
+# /v1/download-installer to query the latest release and resolve asset
+# download URLs. Generate at:
+#   https://github.com/settings/personal-access-tokens
+#   → "Fine-grained tokens" → Resource owner = RefinedMotion
+#   → Repository access = Only select repositories → stacked-captions
+#   → Repository permissions → Contents = Read-only
+GITHUB_TOKEN=YOUR_FINE_GRAINED_PAT_HERE

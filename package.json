@@ -1,0 +1,20 @@
+{
+  "name": "stacked-captions-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:create": "wrangler d1 create stacked-captions-db",
+    "db:init": "wrangler d1 execute stacked-captions-db --remote --file=./schema/init.sql",
+    "db:init-local": "wrangler d1 execute stacked-captions-db --local  --file=./schema/init.sql",
+    "secrets:put": "wrangler secret put TOKEN_SECRET && wrangler secret put ADMIN_TOKEN && wrangler secret put ANTHROPIC_API_KEY"
+  },
+  "devDependencies": {
+    "wrangler": "^4.92.0"
+  },
+  "dependencies": {
+    "hono": "^4.6.13"
+  }
+}

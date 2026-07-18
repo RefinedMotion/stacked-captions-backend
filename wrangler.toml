@@ -1,0 +1,59 @@
+name = "stacked-captions-api"
+main = "src/index.js"
+compatibility_date = "2024-12-01"
+
+# Publish to the *.workers.dev subdomain (we'll add a custom domain later).
+workers_dev = true
+# Preview URLs (one per deploy) are handy for testing without affecting prod.
+preview_urls = true
+
+# D1 binding — replace database_id after running `wrangler d1 create stacked-captions-db`
+[[d1_databases]]
+binding       = "DB"
+database_name = "stacked-captions-db"
+database_id   = "7ae1a0b4-8bca-4c27-9bf8-8aa02526f9b8"
+
+# Public, non-secret variables
+[vars]
+APP_ENV = "development"
+
+# Lemon Squeezy variant IDs — these come from the LS dashboard per-product.
+# LIVE Mode IDs (current, set 2026-06-27). Test-mode IDs were
+# 1659298 (monthly) / 1659274 (annual) — kept here for reference only.
+LS_VARIANT_MONTHLY = "1659438"
+LS_VARIANT_ANNUAL  = "1659439"
+
+# Email branding (used in transactional emails sent via Resend)
+FROM_EMAIL    = "noreply@mail.refinedmotion.de"
+FROM_NAME     = "Stacked Captions"
+SUPPORT_EMAIL = "mail@refinedmotion.de"
+
+# Per-license MONTHLY AI cost budget in USD. Each Anthropic call's actual
+# usage is summed up over the month. Once the budget is reached, further
+# calls are blocked until the 1st of the next month (00:00 UTC). Tracks
+# fair usage: small tasks cost little, large batches cost more — same
+# monthly ceiling for everyone.
+#
+# Plugin displays this as a token count via "1 µUSD = 1 token" mapping
+# (i.e. budget in tokens = USD × 1,000,000). Output tokens cost 5× input
+# tokens at Anthropic, so an output token contributes 5 "tokens" to the
+# displayed count. Slightly opaque to end users but accurate cost-wise.
+#
+# v1.0.7 (2026-07-13): standing budget cut $4.05 → $1.00 (= 1,000,000 tokens).
+# Existing customers are grandfathered to the old 4,050,000 until their next
+# cycle via licenseBudgetMicroUsd() in src/index.js (see QUOTA_PATCH_EPOCH_MS).
+MONTHLY_AI_BUDGET_USD = "1.00"
+
+# Secrets (set via `wrangler secret put NAME`, NEVER commit to wrangler.toml):
+#   TOKEN_SECRET         — long random string for HMAC token signing
+#   ADMIN_TOKEN          — long random string protecting /v1/admin/* endpoints
+#   ANTHROPIC_API_KEY    — Anthropic API key (sk-ant-...) for /v1/ai-apply
+#   ELEVENLABS_API_KEY   — ElevenLabs API key for /v1/transcribe (Scribe v2 STT)
+#   LS_WEBHOOK_SECRET    — HMAC secret Lemon Squeezy uses to sign webhook calls
+#   RESEND_API_KEY       — Resend API key for transactional license emails
+#   GITHUB_TOKEN         — fine-grained GitHub PAT (read-only Contents on
+#                          RefinedMotion/stacked-captions) for /v1/check-update
+#                          and /v1/download-installer. Create at
+#                          https://github.com/settings/personal-access-tokens
+#                          → "Fine-grained tokens" → only that one repo,
+#                          permissions: Contents = Read-only.
