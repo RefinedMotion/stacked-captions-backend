@@ -190,6 +190,16 @@ function monthlyBudgetMicroUsd(env) {
   return Math.round(usd * 1_000_000);
 }
 
+// Annual-plan monthly budget (ANNUAL_AI_BUDGET_USD, default $2.00 →
+// 2,000,000 tokens). Purchase incentive for the annual subscription —
+// applies to every license whose plan is "annual", INCLUDING trials on the
+// annual plan (deliberate: the trial should show the full annual experience).
+function annualBudgetMicroUsd(env) {
+  const raw = parseFloat(env && env.ANNUAL_AI_BUDGET_USD);
+  const usd = (isFinite(raw) && raw > 0) ? raw : 2.00;
+  return Math.round(usd * 1_000_000);
+}
+
 // v1.0.7 (2026-07-13): the standing AI quota was cut from 4,050,000 to
 // 1,000,000 tokens/month. Existing customers are GRANDFATHERED — they keep the
 // legacy 4,050,000 budget until the end of their CURRENT monthly cycle, then
@@ -203,14 +213,20 @@ const QUOTA_PATCH_EPOCH_MS    = 1783945116581; // 2026-07-13T12:18:36.581Z
 const LEGACY_BUDGET_MICRO_USD = 4_050_000;     // grandfathered monthly budget
 
 function licenseBudgetMicroUsd(env, lic) {
-  const low = monthlyBudgetMicroUsd(env); // new standing budget
-  if (!lic || !lic.created_at) return low;
-  // Bought at/after the patch → new budget from the start.
-  if (lic.created_at >= QUOTA_PATCH_EPOCH_MS) return low;
+  // Standing budget by plan: annual subscriptions (incl. trial-on-annual)
+  // get the higher annual budget — everyone else the standard monthly one.
+  const standing = (lic && lic.plan === "annual")
+    ? annualBudgetMicroUsd(env)
+    : monthlyBudgetMicroUsd(env);
+  if (!lic || !lic.created_at) return standing;
+  // Bought at/after the patch → standing budget from the start.
+  if (lic.created_at >= QUOTA_PATCH_EPOCH_MS) return standing;
   // Existing customer → keep the legacy budget until the first monthly
   // anniversary reset at/after the patch (= end of their current cycle).
+  // Math.max so a plan whose standing budget exceeds the legacy value could
+  // never be DOWNgraded by the grandfather window.
   const boundary = nextAnniversaryResetUtcMs(lic.created_at, QUOTA_PATCH_EPOCH_MS);
-  return nowMs() < boundary ? LEGACY_BUDGET_MICRO_USD : low;
+  return nowMs() < boundary ? Math.max(LEGACY_BUDGET_MICRO_USD, standing) : standing;
 }
 
 // v1.0.7: past_due customers get a bounded SOFT GRACE — the license stays

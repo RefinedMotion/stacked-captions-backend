@@ -44,6 +44,12 @@ SUPPORT_EMAIL = "mail@refinedmotion.de"
 # cycle via licenseBudgetMicroUsd() in src/index.js (see QUOTA_PATCH_EPOCH_MS).
 MONTHLY_AI_BUDGET_USD = "1.00"
 
+# 2026-08-03: annual-subscription incentive — licenses with plan "annual"
+# (including trials on the annual plan) get this higher monthly budget
+# instead ($2.00 = 2,000,000 tokens). Resolved per-license in
+# licenseBudgetMicroUsd().
+ANNUAL_AI_BUDGET_USD = "2.00"
+
 # Secrets (set via `wrangler secret put NAME`, NEVER commit to wrangler.toml):
 #   TOKEN_SECRET         — long random string for HMAC token signing
 #   ADMIN_TOKEN          — long random string protecting /v1/admin/* endpoints
