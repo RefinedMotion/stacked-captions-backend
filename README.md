@@ -12,6 +12,11 @@ webhooks in Phase 4c.
 | POST   | `/v1/heartbeat`               | License key + fingerprint  | Re-validate + refresh token      |
 | POST   | `/v1/ai-apply`                | Signed token from activate | Proxy to Anthropic               |
 | POST   | `/v1/admin/create-license`    | `Authorization: Bearer …`  | Dev/admin: manually mint license |
+| POST   | `/v1/machines`                | License key (+ fingerprint) | Machines using a license (display ids) |
+| POST   | `/v1/deactivate`              | License key (+ fingerprint) | Free a machine slot (own or by row id) |
+| POST   | `/v1/admin/remove-machine`    | `Authorization: Bearer …`  | Admin: free a customer's slot    |
+| POST   | `/v1/admin/set-license-status`| `Authorization: Bearer …`  | Admin: correct a license status  |
+| POST   | `/v1/webhooks/lemon-squeezy`  | HMAC signature             | Lemon Squeezy subscription events |
 | GET    | `/`                           | none                       | Health check                     |
 
 ## Local setup (Windows PowerShell)
@@ -202,7 +207,9 @@ Each license runs on `machines_allowed` (default 2) machines = rows in `machines
 Since 2026-10 a slot can be released without support:
 
 - `POST /v1/machines` `{ licenseKey, fingerprint? }` -> the machines of a license
-  (`id`, 14-char fingerprint prefix `fp`, `os`, `appVersion`, `firstSeenAt`,
+  (`id`, `displayId` = first 8 hex of SHA-256(fingerprint) — the raw fingerprint is
+  never returned, with the key it would let a third computer impersonate a
+  registered one on /v1/heartbeat —, `os`, `appVersion`, `firstSeenAt`,
   `lastSeenAt`, `current` = the calling machine). The key is the credential;
   works for expired licenses too (tidying up is always allowed).
 - `POST /v1/deactivate` `{ licenseKey, fingerprint?, machineId? }` -> releases the
@@ -213,14 +220,19 @@ Since 2026-10 a slot can be released without support:
   has not been seen for 30 days (`machine_deactivated`, `reason: idle_evicted`);
   otherwise the 403 carries `machines: [...]` so the panel can offer
   "Sign out & activate here".
-- Admin: `POST /v1/admin/remove-machine` `{ licenseKey, machineId? | fingerprint? }`
-  (a unique prefix is enough) -> `admin-remove-machine.ps1`.
+- Admin: `POST /v1/admin/remove-machine` `{ licenseKey, machineId? | displayId? | fingerprint? }`
+  (display id as the panel shows it, or a unique fingerprint prefix) -> `admin-remove-machine.ps1`.
+  `customer-detail` prints both ids per machine.
 - Admin: `POST /v1/admin/set-license-status` `{ licenseKey, status, reason? }` ->
   used by `admin-sync-unpaid.ps1` (dry run by default, `-Apply` retires the
   `past_due` licenses whose Lemon Squeezy subscription is `unpaid`/`expired`/ended).
   The webhook now maps LS `unpaid` -> `expired` (a later `subscription_payment_success`
-  reactivates as before).
+  reactivates). Fixed in the same round: the payment events carry a
+  Subscription INVOICE, so the subscription id is read from
+  `attributes.subscription_id` (before, `data.id` = the invoice id never matched a
+  license — renewals only worked through the parallel `subscription_updated`), and
+  a late `subscription_payment_failed` no longer revives an expired license.
 
-Tests: `scratchpad/backend-test/run.mjs` (Claude session scratchpad) runs the real
-Hono app on an in-memory SQLite that mimics D1 (node:sqlite, Node 24): 43 checks
-over activate / limit / list / release / eviction / admin / webhook.
+Tests: `npm test` (`test/run.mjs`) runs the real Hono app on an in-memory SQLite
+that mimics D1 (node:sqlite, Node 22.5+): activate / limit / list / release /
+eviction / admin / webhook (invoice-shaped payment events) / status sync.

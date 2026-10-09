@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
+    "test": "node test/run.mjs",
     "deploy": "wrangler deploy",
     "db:create": "wrangler d1 create stacked-captions-db",
     "db:init": "wrangler d1 execute stacked-captions-db --remote --file=./schema/init.sql",

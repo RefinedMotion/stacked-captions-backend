@@ -7,11 +7,12 @@
 # for the cases that still reach support.
 #
 # Find the machine first:
-#   .\admin-customer-detail.ps1 -Q anna@example.com      # prints [sc-m-xxxxxxxx...] per machine
+#   .\admin-customer-detail.ps1 -Q anna@example.com      # prints id=.. [display id] (sc-m-...) per machine
 #
-# Then:
-#   .\admin-remove-machine.ps1 -Key SC-4Y6A-... -Fingerprint sc-m-6ab1c2d3   # unique prefix is enough
+# Then (the display id is what the customer sees in the panel):
+#   .\admin-remove-machine.ps1 -Key SC-4Y6A-... -DisplayId 3f9a1c77
 #   .\admin-remove-machine.ps1 -Key SC-4Y6A-... -MachineId 123
+#   .\admin-remove-machine.ps1 -Key SC-4Y6A-... -Fingerprint sc-m-6ab1c2d3   # unique prefix is enough
 #
 # Requires SC_ADMIN_TOKEN env var or it will prompt.
 # =============================================================================
@@ -21,6 +22,7 @@ param(
   [string]$Key,
 
   [string]$Fingerprint = "",
+  [string]$DisplayId   = "",
   [int]$MachineId      = 0,
 
   [string]$Api         = "https://api.refinedmotion.de"
@@ -28,8 +30,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-if (-not $Fingerprint -and $MachineId -le 0) {
-  Write-Host "Give -Fingerprint (prefix as shown by admin-customer-detail.ps1) or -MachineId." -ForegroundColor Red
+$Fingerprint = $Fingerprint.Trim().TrimEnd('.')
+$DisplayId   = $DisplayId.Trim().TrimEnd('.')
+if (-not $Fingerprint -and -not $DisplayId -and $MachineId -le 0) {
+  Write-Host "Give -DisplayId (as shown in the panel / customer-detail), -MachineId or -Fingerprint (unique prefix)." -ForegroundColor Red
   exit 1
 }
 
@@ -49,12 +53,14 @@ function Show-Machines($machines) {
   foreach ($m in $machines) {
     $os  = if ($m.os) { $m.os } else { "?" }
     $ver = if ($m.appVersion) { $m.appVersion } else { "?" }
-    Write-Host ("    id={0,-6} [{1}...]  {2}  v{3}  first={4}  last={5}" -f $m.id, $m.fp, $os, $ver, (Format-Date $m.firstSeenAt), (Format-Date $m.lastSeenAt))
+    Write-Host ("    id={0,-6} [{1}]  {2}  v{3}  first={4}  last={5}" -f $m.id, $m.displayId, $os, $ver, (Format-Date $m.firstSeenAt), (Format-Date $m.lastSeenAt))
   }
 }
 
 $body = @{ licenseKey = $Key }
-if ($MachineId -gt 0) { $body.machineId = $MachineId } else { $body.fingerprint = $Fingerprint }
+if ($MachineId -gt 0) { $body.machineId = $MachineId }
+elseif ($DisplayId) { $body.displayId = $DisplayId }
+else { $body.fingerprint = $Fingerprint }
 $json = $body | ConvertTo-Json -Compress
 
 try {
@@ -74,7 +80,7 @@ try {
 }
 
 Write-Host ""
-Write-Host ("Removed machine [{0}...] ({1}, v{2}, last seen {3}) from {4}" -f $response.removed.fp, $response.removed.os, $response.removed.appVersion, (Format-Date $response.removed.lastSeenAt), $Key) -ForegroundColor Green
+Write-Host ("Removed machine [{0}] ({1}, v{2}, last seen {3}) from {4}" -f $response.removed.displayId, $response.removed.os, $response.removed.appVersion, (Format-Date $response.removed.lastSeenAt), $Key) -ForegroundColor Green
 Write-Host ("Slots now: {0} / {1}" -f $response.machinesUsed, $response.machinesAllowed)
 Write-Host ""
 Write-Host "  Remaining machines:" -ForegroundColor Yellow

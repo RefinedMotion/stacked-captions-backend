@@ -116,9 +116,10 @@ foreach ($cust in $response.customers) {
       }
       $os  = if ($m.os) { $m.os } else { "?" }
       $ver = if ($m.app_version) { $m.app_version } else { "?" }
+      $did = if ($m.display_id) { $m.display_id } else { "?" }
       $firstStr = Format-Date $m.first_seen_at
       $lastStr  = Format-Date $m.last_seen_at
-      Write-Host ("    [{0}]  {1}  v{2}  first={3}  last={4}" -f $fp, $os, $ver, $firstStr, $lastStr)
+      Write-Host ("    [{0}] ({1})  {2}  v{3}  first={4}  last={5}" -f $did, $fp, $os, $ver, $firstStr, $lastStr)
     }
   }
 

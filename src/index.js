@@ -115,13 +115,26 @@ async function findLicense(db, key) {
 // never has to free it by hand.
 const MACHINE_IDLE_EVICT_MS = 30 * 24 * 60 * 60 * 1000;
 
-// Machine rows as the panel shows them: no full fingerprints (the 14-char
-// prefix is what support conversations use), the row id is what the panel
-// releases a slot by, current = the calling machine.
-function machineView(m, currentFp) {
+// One-way display id of a machine: the first 8 hex digits of SHA-256 of the
+// fingerprint. The panel shows it and support asks customers to read it out.
+// The raw fingerprint is never returned to the panel: together with the key
+// it would let a third computer impersonate a registered one on /v1/heartbeat
+// and use the AI proxy without taking a slot.
+async function machineDisplayId(fingerprint) {
+  try {
+    const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(fingerprint || "")));
+    const bytes = new Uint8Array(buf);
+    let hex = "";
+    for (let i = 0; i < 4; i++) hex += bytes[i].toString(16).padStart(2, "0");
+    return hex;
+  } catch (e) { return ""; }
+}
+// Machine rows as the panel shows them; the row id is what the panel releases
+// a slot by, `current` marks the calling machine.
+async function machineView(m, currentFp) {
   return {
     id:          m.id,
-    fp:          String(m.fingerprint || "").slice(0, 14),
+    displayId:   await machineDisplayId(m.fingerprint),
     os:          m.os || "",
     appVersion:  m.app_version || "",
     firstSeenAt: m.first_seen_at || null,
@@ -129,27 +142,43 @@ function machineView(m, currentFp) {
     current:     !!currentFp && m.fingerprint === currentFp
   };
 }
+async function machineViews(rows, currentFp) {
+  const out = [];
+  for (const m of rows) out.push(await machineView(m, currentFp));
+  return out;
+}
 async function listMachines(db, licenseKey, currentFp) {
   const rs = await db.prepare(
     "SELECT * FROM machines WHERE license_key = ? ORDER BY last_seen_at DESC, id ASC"
   ).bind(licenseKey).all();
-  return (rs.results || []).map(m => machineView(m, currentFp));
+  return await machineViews(rs.results || [], currentFp);
 }
-// Resolves the machine a deactivation targets: by row id, else by the full
-// fingerprint, else by a unique fingerprint prefix (admin use). null = none.
-async function findMachine(db, licenseKey, { machineId, fingerprint }) {
-  const id = parseInt(machineId, 10);
+// Resolves the machine a deactivation targets. Self-service: the row id or
+// the caller's EXACT fingerprint. Admin (allowPrefix): additionally a display
+// id or a unique fingerprint prefix (LIKE with escaped wildcards). null = none.
+async function findMachine(db, licenseKey, opts) {
+  opts = opts || {};
+  const id = parseInt(opts.machineId, 10);
   if (id > 0) {
     return await db.prepare("SELECT * FROM machines WHERE id = ? AND license_key = ?").bind(id, licenseKey).first();
   }
-  const fp = String(fingerprint || "").trim();
-  if (!fp) return null;
-  const exact = await db.prepare("SELECT * FROM machines WHERE license_key = ? AND fingerprint = ?").bind(licenseKey, fp).first();
-  if (exact) return exact;
-  if (fp.length < 8) return null;
-  const rs = await db.prepare("SELECT * FROM machines WHERE license_key = ? AND fingerprint LIKE ?").bind(licenseKey, fp + "%").all();
-  const hits = rs.results || [];
-  return hits.length === 1 ? hits[0] : null;
+  const fp = String(opts.fingerprint || "").trim();
+  if (fp) {
+    const exact = await db.prepare("SELECT * FROM machines WHERE license_key = ? AND fingerprint = ?").bind(licenseKey, fp).first();
+    if (exact || !opts.allowPrefix || fp.length < 8) return exact;
+    const like = fp.replace(/[\\%_]/g, "\\$&") + "%";
+    const rs = await db.prepare("SELECT * FROM machines WHERE license_key = ? AND fingerprint LIKE ? ESCAPE '\\'").bind(licenseKey, like).all();
+    const hits = rs.results || [];
+    return hits.length === 1 ? hits[0] : null;
+  }
+  const disp = String(opts.displayId || "").trim().toLowerCase();
+  if (disp && opts.allowPrefix) {
+    const all = await db.prepare("SELECT * FROM machines WHERE license_key = ?").bind(licenseKey).all();
+    for (const m of (all.results || [])) {
+      if ((await machineDisplayId(m.fingerprint)) === disp) return m;
+    }
+  }
+  return null;
 }
 async function releaseMachine(db, licenseKey, machine, detail) {
   await db.prepare("DELETE FROM machines WHERE id = ?").bind(machine.id).run();
@@ -160,16 +189,6 @@ async function releaseMachine(db, licenseKey, machine, detail) {
   });
 }
 
-// Append a row to the events table. Best-effort: errors are logged but never
-// fail the parent operation — we don't want telemetry bugs to break a payment
-// webhook or an AI call.
-//
-//   db          - c.env.DB
-//   licenseKey  - SC-... or null for system events
-//   email       - denormalised email or null
-//   eventType   - one of the strings documented in schema/add-events.sql
-//   detail      - object that will be JSON-encoded into the `detail` column
-//   costMicroUsd- AI cost for ai_call events; 0 otherwise
 async function logEvent(db, { licenseKey, email, eventType, detail, costMicroUsd }) {
   try {
     await db.prepare(`
@@ -454,7 +473,7 @@ app.post("/v1/activate", async (c) => {
         error:           "machine limit reached",
         machinesUsed:    machines.length,
         machinesAllowed: allowed,
-        machines:        machines.map(m => machineView(m, fingerprint)),
+        machines:        await machineViews(machines, fingerprint),
         hint:            "Sign out one of the listed machines (License & Account > Manage machines) to free a slot."
       }, 403);
     }
@@ -590,7 +609,7 @@ app.post("/v1/heartbeat", async (c) => {
 // panel's "Manage machines" dialog lists them; works for any existing
 // license, so an expired one can still tidy up its slots.
 // Input:  { licenseKey, fingerprint? }   (fingerprint = the caller, for `current`)
-// Output: { ok, machines: [{ id, fp, os, appVersion, firstSeenAt, lastSeenAt, current }], machinesUsed, machinesAllowed }
+// Output: { ok, machines: [{ id, displayId, os, appVersion, firstSeenAt, lastSeenAt, current }], machinesUsed, machinesAllowed }
 // ---------------------------------------------------------------------------
 app.post("/v1/machines", async (c) => {
   let body;
@@ -1588,7 +1607,12 @@ app.post("/v1/webhooks/lemon-squeezy", async (c) => {
 
   const eventName = payload && payload.meta && payload.meta.event_name;
   const attrs = payload && payload.data && payload.data.attributes;
-  const subId = payload && payload.data && payload.data.id ? String(payload.data.id) : null;
+  // Subscription events carry the Subscription object (data.id = subscription
+  // id). The payment events (subscription_payment_success / _failed /
+  // _recovered) carry a Subscription INVOICE: data.id is the invoice id and
+  // the subscription id sits in attributes.subscription_id.
+  const subId = (attrs && attrs.subscription_id != null && String(attrs.subscription_id)) ||
+                (payload && payload.data && payload.data.id ? String(payload.data.id) : null);
 
   console.log("LS webhook:", eventName, "subId=", subId);
 
@@ -1608,18 +1632,20 @@ app.post("/v1/webhooks/lemon-squeezy", async (c) => {
   // lifecycle (trial → active → cancelled/expired) automatically.
   if (subId && eventName !== "subscription_created" && attrs) {
     try {
-      const known = await db.prepare("SELECT id FROM licenses WHERE subscription_id = ?").bind(subId).first();
+      const known = await db.prepare("SELECT key FROM licenses WHERE subscription_id = ?").bind(subId).first();
       if (!known) {
         const healEmail = String(attrs.user_email || "").toLowerCase().trim();
         if (healEmail) {
+          // (licenses are keyed by `key`; the former `l.id` lookup threw inside
+          // this try and the self-heal never linked anything.)
           const orphan = await db.prepare(
-            "SELECT l.id, l.key FROM licenses l JOIN users u ON u.id = l.user_id " +
+            "SELECT l.key FROM licenses l JOIN users u ON u.id = l.user_id " +
             "WHERE lower(u.email) = ? AND (l.subscription_id IS NULL OR l.subscription_id = '') " +
             "ORDER BY l.created_at DESC LIMIT 1"
           ).bind(healEmail).first();
           if (orphan) {
-            await db.prepare("UPDATE licenses SET subscription_id = ?, updated_at = ? WHERE id = ?")
-                    .bind(subId, nowMs(), orphan.id).run();
+            await db.prepare("UPDATE licenses SET subscription_id = ?, updated_at = ? WHERE key = ?")
+                    .bind(subId, nowMs(), orphan.key).run();
             await logEvent(db, {
               licenseKey: orphan.key, email: healEmail,
               eventType:  "license_subscription_linked",
@@ -1809,6 +1835,12 @@ app.post("/v1/webhooks/lemon-squeezy", async (c) => {
   if (eventName === "subscription_payment_failed") {
     if (!subId) return c.json({ ok: true });
     const prev = await _licForSub(subId);
+    // Only a license that still has access enters past_due. The final failed
+    // retry can arrive after subscription_updated(unpaid) mapped the license
+    // to expired — it must not revive it into a fresh 3-day grace.
+    if (prev && !["active", "trial", "past_due"].includes(prev.prev_status)) {
+      return c.json({ ok: true, event: eventName, note: "ignored for status " + prev.prev_status });
+    }
     // Stamp past_due_since ONLY on the first entry into past_due, so the 3-day
     // grace clock isn't reset by each of LS's ~4 dunning retries.
     if (prev && prev.prev_status === "past_due") {
@@ -2073,6 +2105,12 @@ app.get("/v1/admin/customer-detail", async (c) => {
       ORDER BY last_seen_at DESC
     `).bind(lic.key).all();
 
+    // What the panel shows for each machine (and what a customer reads out).
+    const machinesOut = [];
+    for (const m of (machinesRs.results || [])) {
+      machinesOut.push(Object.assign({}, m, { display_id: await machineDisplayId(m.fingerprint) }));
+    }
+
     // Recent events for this license, newest first
     const eventsRs = await db.prepare(`
       SELECT created_at, event_type, detail, cost_micro_usd
@@ -2118,7 +2156,7 @@ app.get("/v1/admin/customer-detail", async (c) => {
       ai_cost_reset_at:             lic.ai_cost_reset_at,
       ai_cost_limit_micro_usd:      monthlyBudgetMicroUsd(c.env),
       // Joined data
-      machines:        machinesRs.results || [],
+      machines:        machinesOut,
       events:          (eventsRs.results || []).map(e => ({
         created_at:     e.created_at,
         event_type:     e.event_type,
@@ -2178,9 +2216,10 @@ app.onError((err, c) => {
 
 // ---------------------------------------------------------------------------
 // Admin: free a machine slot for a customer (support case "machine limit
-// reached" with a stale machine). The machine is addressed by row id, full
-// fingerprint or a unique fingerprint prefix (as shown by customer-detail).
-//   POST /v1/admin/remove-machine  { licenseKey, machineId? | fingerprint? }
+// reached" with a stale machine). The machine is addressed by row id, the
+// display id the panel shows, a full fingerprint or a unique fingerprint
+// prefix (customer-detail prints both).
+//   POST /v1/admin/remove-machine  { licenseKey, machineId? | displayId? | fingerprint? }
 // ---------------------------------------------------------------------------
 app.post("/v1/admin/remove-machine", async (c) => {
   const auth = c.req.header("Authorization") || "";
@@ -2196,21 +2235,21 @@ app.post("/v1/admin/remove-machine", async (c) => {
   const db  = c.env.DB;
   const lic = await findLicense(db, licenseKey);
   if (!lic) return c.json({ error: "license not found" }, 404);
-  const target = await findMachine(db, licenseKey, { machineId: body.machineId, fingerprint: body.fingerprint });
+  const target = await findMachine(db, licenseKey, { machineId: body.machineId, fingerprint: body.fingerprint, displayId: body.displayId, allowPrefix: true });
   if (!target) {
     const machines = await listMachines(db, licenseKey, "");
     return c.json({ error: "machine not found (or prefix not unique)", machines }, 404);
   }
   await releaseMachine(db, licenseKey, target, { reason: "admin", by: "admin" });
   const machines = await listMachines(db, licenseKey, "");
-  return c.json({ ok: true, removed: machineView(target, ""), machines, machinesUsed: machines.length, machinesAllowed: lic.machines_allowed || 2 });
+  return c.json({ ok: true, removed: await machineView(target, ""), machines, machinesUsed: machines.length, machinesAllowed: lic.machines_allowed || 2 });
 });
 
 // ---------------------------------------------------------------------------
 // Admin: correct a license status (used by admin-sync-unpaid.ps1 to retire
 // licenses whose Lemon Squeezy subscription went "unpaid" before the webhook
 // mapped that status). Logged like a webhook status change.
-//   POST /v1/admin/set-license-status  { licenseKey, status, reason? }
+//   POST /v1/admin/set-license-status  { licenseKey, status, reason?, expiresAt? | days? }
 // ---------------------------------------------------------------------------
 app.post("/v1/admin/set-license-status", async (c) => {
   const auth = c.req.header("Authorization") || "";
@@ -2230,17 +2269,29 @@ app.post("/v1/admin/set-license-status", async (c) => {
   const db  = c.env.DB;
   const lic = await findLicense(db, licenseKey);
   if (!lic) return c.json({ error: "license not found" }, 404);
-  if (lic.status === status) return c.json({ ok: true, changed: false, status });
+  // Optional new expiry (ms) or +days; "active"/"trial" with an expiry in the
+  // past would report success while isLicenseUsable keeps rejecting it.
+  const nowTs = nowMs();
+  let newExpires = null;
+  if (body.expiresAt != null) newExpires = parseInt(body.expiresAt, 10) || null;
+  else if (body.days != null) newExpires = nowTs + (parseInt(body.days, 10) || 0) * 24 * 60 * 60 * 1000;
+  const effectiveExpires = newExpires != null ? newExpires : lic.expires_at;
+  if ((status === "active" || status === "trial") && effectiveExpires && effectiveExpires < nowTs) {
+    return c.json({ error: "expires_at is in the past; pass expiresAt (ms) or days to extend the license", expires_at: lic.expires_at }, 400);
+  }
+  if (lic.status === status && newExpires == null) return c.json({ ok: true, changed: false, status });
+  // Entering past_due here is always a fresh entry (a stale stamp from an
+  // earlier past_due period would end the 3-day grace at once).
   await db.prepare(
-    "UPDATE licenses SET status = ?, past_due_since = CASE WHEN ? = 'past_due' THEN COALESCE(past_due_since, ?) ELSE NULL END, updated_at = ? WHERE key = ?"
-  ).bind(status, status, nowMs(), nowMs(), licenseKey).run();
+    "UPDATE licenses SET status = ?, expires_at = COALESCE(?, expires_at), past_due_since = CASE WHEN ? = 'past_due' THEN ? ELSE NULL END, updated_at = ? WHERE key = ?"
+  ).bind(status, newExpires, status, nowTs, nowTs, licenseKey).run();
   const u = await db.prepare("SELECT email FROM users WHERE id = ?").bind(lic.user_id).first();
   await logEvent(db, {
     licenseKey, email: u ? u.email : null,
     eventType:  "license_status_changed",
-    detail:     { from: lic.status, to: status, by: "admin", reason: reason || null }
+    detail:     { from: lic.status, to: status, by: "admin", reason: reason || null, expiresAt: newExpires }
   });
-  return c.json({ ok: true, changed: true, from: lic.status, status });
+  return c.json({ ok: true, changed: true, from: lic.status, status, expiresAt: effectiveExpires });
 });
 
 export default app;

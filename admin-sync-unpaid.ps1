@@ -36,7 +36,13 @@ if (-not $lsKey) { $lsKey = Read-Secret "LS_API_KEY" }
 $adminHeaders = @{ Authorization = "Bearer $token" }
 $lsHeaders    = @{ Authorization = "Bearer $lsKey"; Accept = "application/vnd.api+json" }
 
-$list = Invoke-RestMethod -Method Get -Uri "$Api/v1/admin/list-licenses?status=past_due&limit=500" -Headers $adminHeaders
+try {
+  $list = Invoke-RestMethod -Method Get -Uri "$Api/v1/admin/list-licenses?status=past_due&limit=500" -Headers $adminHeaders
+} catch {
+  Write-Host "Request failed: $($_.Exception.Message)" -ForegroundColor Red
+  if ($_.ErrorDetails.Message) { Write-Host "  $($_.ErrorDetails.Message)" -ForegroundColor Red }
+  exit 1
+}
 $rows = @($list.licenses)
 Write-Host ""
 Write-Host ("past_due licenses in our DB: {0}" -f $rows.Count)
@@ -45,6 +51,7 @@ if ($rows.Count -eq 0) { exit 0 }
 $toExpire = @()
 $keep     = 0
 $noSub    = 0
+$unknown  = 0
 foreach ($lic in $rows) {
   $sub = "$($lic.subscription_id)"
   if (-not ($sub -match '^\d+$')) { $noSub++; Write-Host ("  {0,-34} {1,-28} no LS subscription id -> skipped" -f $lic.key, $lic.email); continue }
@@ -56,6 +63,11 @@ foreach ($lic in $rows) {
   }
   $a = $ls.data.attributes
   $lsStatus = "$($a.status)"
+  if (-not $lsStatus) {
+    $unknown++
+    Write-Host ("  {0,-34} {1,-28} unexpected LS response (no status) -> skipped" -f $lic.key, $lic.email) -ForegroundColor Yellow
+    continue
+  }
   $endsAt   = $a.ends_at
   $ended    = $false
   if ($endsAt) { try { $ended = ([DateTime]::Parse($endsAt).ToUniversalTime() -lt [DateTime]::UtcNow) } catch {} }
@@ -70,7 +82,7 @@ foreach ($lic in $rows) {
 }
 
 Write-Host ""
-Write-Host ("to expire: {0}   keep: {1}   without subscription: {2}" -f $toExpire.Count, $keep, $noSub)
+Write-Host ("to expire: {0}   keep: {1}   without subscription: {2}   unreadable: {3}" -f $toExpire.Count, $keep, $noSub, $unknown)
 if (-not $Apply) {
   Write-Host "Dry run - nothing changed. Re-run with -Apply to retire the listed licenses." -ForegroundColor Yellow
   exit 0
