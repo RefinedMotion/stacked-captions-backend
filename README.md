@@ -193,5 +193,34 @@ We'll point a custom domain at it later (e.g. `api.stackedcaptions.com`).
 
 - ❌ Lemon Squeezy webhook integration (Phase 4c)
 - ❌ Token rate-limiting per license (Phase 4c)
-- ❌ Customer portal for self-service deactivation (Phase 4c)
+- ✅ Self-service machine-slot release (2026-10, panel v1.1.0): see "Machine slots" below
 - ❌ Plugin-side: license-key UI + token caching + AI calls routed through proxy (Phase 4b)
+
+## Machine slots (2026-10, panel v1.1.0)
+
+Each license runs on `machines_allowed` (default 2) machines = rows in `machines`.
+Since 2026-10 a slot can be released without support:
+
+- `POST /v1/machines` `{ licenseKey, fingerprint? }` -> the machines of a license
+  (`id`, 14-char fingerprint prefix `fp`, `os`, `appVersion`, `firstSeenAt`,
+  `lastSeenAt`, `current` = the calling machine). The key is the credential;
+  works for expired licenses too (tidying up is always allowed).
+- `POST /v1/deactivate` `{ licenseKey, fingerprint?, machineId? }` -> releases the
+  calling machine's slot (panel "Sign out") or another machine by row id (panel
+  "Manage machines" / the machine-limit notice). Idempotent (`removed: 0|1`),
+  logs `machine_deactivated` (`reason: self_service`).
+- `/v1/activate` at the limit: the longest-idle machine yields its slot when it
+  has not been seen for 30 days (`machine_deactivated`, `reason: idle_evicted`);
+  otherwise the 403 carries `machines: [...]` so the panel can offer
+  "Sign out & activate here".
+- Admin: `POST /v1/admin/remove-machine` `{ licenseKey, machineId? | fingerprint? }`
+  (a unique prefix is enough) -> `admin-remove-machine.ps1`.
+- Admin: `POST /v1/admin/set-license-status` `{ licenseKey, status, reason? }` ->
+  used by `admin-sync-unpaid.ps1` (dry run by default, `-Apply` retires the
+  `past_due` licenses whose Lemon Squeezy subscription is `unpaid`/`expired`/ended).
+  The webhook now maps LS `unpaid` -> `expired` (a later `subscription_payment_success`
+  reactivates as before).
+
+Tests: `scratchpad/backend-test/run.mjs` (Claude session scratchpad) runs the real
+Hono app on an in-memory SQLite that mimics D1 (node:sqlite, Node 24): 43 checks
+over activate / limit / list / release / eviction / admin / webhook.

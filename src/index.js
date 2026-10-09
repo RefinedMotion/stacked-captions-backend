@@ -14,6 +14,10 @@
  *   GET  /v1/admin/find-license    (admin — exact email match)
  *   GET  /v1/admin/list-licenses   (admin — filters + free-text search)
  *   GET  /v1/admin/customer-detail (admin — deep dive: events + machines + AI rollup)
+ *   POST /v1/machines         (list the machines of a license; key = credential)
+ *   POST /v1/deactivate       (release a machine slot: the caller's own, or one by row id)
+ *   POST /v1/admin/remove-machine      (admin — free a slot for a customer)
+ *   POST /v1/admin/set-license-status  (admin — correct a license status, e.g. LS "unpaid" leftovers)
  *
  * Auth flow:
  *   1. Plugin calls /v1/activate with the user's license key + a machine
@@ -103,6 +107,57 @@ function randomLicenseKey() {
 // License sanity check (used by /activate, /heartbeat, /ai-apply).
 async function findLicense(db, key) {
   return await db.prepare("SELECT * FROM licenses WHERE key = ?").bind(key).first();
+}
+
+// ---- Machine slots -------------------------------------------------------
+// A slot whose machine has not been seen for this long yields to a new
+// machine on /activate (a replaced or reinstalled computer) — the customer
+// never has to free it by hand.
+const MACHINE_IDLE_EVICT_MS = 30 * 24 * 60 * 60 * 1000;
+
+// Machine rows as the panel shows them: no full fingerprints (the 14-char
+// prefix is what support conversations use), the row id is what the panel
+// releases a slot by, current = the calling machine.
+function machineView(m, currentFp) {
+  return {
+    id:          m.id,
+    fp:          String(m.fingerprint || "").slice(0, 14),
+    os:          m.os || "",
+    appVersion:  m.app_version || "",
+    firstSeenAt: m.first_seen_at || null,
+    lastSeenAt:  m.last_seen_at || null,
+    current:     !!currentFp && m.fingerprint === currentFp
+  };
+}
+async function listMachines(db, licenseKey, currentFp) {
+  const rs = await db.prepare(
+    "SELECT * FROM machines WHERE license_key = ? ORDER BY last_seen_at DESC, id ASC"
+  ).bind(licenseKey).all();
+  return (rs.results || []).map(m => machineView(m, currentFp));
+}
+// Resolves the machine a deactivation targets: by row id, else by the full
+// fingerprint, else by a unique fingerprint prefix (admin use). null = none.
+async function findMachine(db, licenseKey, { machineId, fingerprint }) {
+  const id = parseInt(machineId, 10);
+  if (id > 0) {
+    return await db.prepare("SELECT * FROM machines WHERE id = ? AND license_key = ?").bind(id, licenseKey).first();
+  }
+  const fp = String(fingerprint || "").trim();
+  if (!fp) return null;
+  const exact = await db.prepare("SELECT * FROM machines WHERE license_key = ? AND fingerprint = ?").bind(licenseKey, fp).first();
+  if (exact) return exact;
+  if (fp.length < 8) return null;
+  const rs = await db.prepare("SELECT * FROM machines WHERE license_key = ? AND fingerprint LIKE ?").bind(licenseKey, fp + "%").all();
+  const hits = rs.results || [];
+  return hits.length === 1 ? hits[0] : null;
+}
+async function releaseMachine(db, licenseKey, machine, detail) {
+  await db.prepare("DELETE FROM machines WHERE id = ?").bind(machine.id).run();
+  await logEvent(db, {
+    licenseKey, email: null,
+    eventType:  "machine_deactivated",
+    detail:     Object.assign({ fingerprint: String(machine.fingerprint || "").slice(0, 14), machineId: machine.id, os: machine.os || "", lastSeenAt: machine.last_seen_at || null }, detail || {})
+  });
 }
 
 // Append a row to the events table. Best-effort: errors are logged but never
@@ -387,12 +442,22 @@ app.post("/v1/activate", async (c) => {
   const allowed  = lic.machines_allowed || 2;
 
   if (!existing && machines.length >= allowed) {
-    return c.json({
-      error:           "machine limit reached",
-      machinesUsed:    machines.length,
-      machinesAllowed: allowed,
-      hint:            "Deactivate one machine in your account portal to free a slot."
-    }, 403);
+    // The longest-idle machine yields its slot when it has not been seen for
+    // 30 days (replaced / reinstalled computer); otherwise the panel gets the
+    // list and lets the customer sign one of them out.
+    const idle = machines.slice().sort((a, b) => (a.last_seen_at || 0) - (b.last_seen_at || 0))[0];
+    if (idle && (nowMs() - (idle.last_seen_at || 0)) > MACHINE_IDLE_EVICT_MS) {
+      await releaseMachine(db, licenseKey, idle, { reason: "idle_evicted", replacedBy: fingerprint.slice(0, 14), os: idle.os || "" });
+      machines.splice(machines.indexOf(idle), 1);
+    } else {
+      return c.json({
+        error:           "machine limit reached",
+        machinesUsed:    machines.length,
+        machinesAllowed: allowed,
+        machines:        machines.map(m => machineView(m, fingerprint)),
+        hint:            "Sign out one of the listed machines (License & Account > Manage machines) to free a slot."
+      }, 403);
+    }
   }
 
   const ts = nowMs();
@@ -518,6 +583,59 @@ app.post("/v1/heartbeat", async (c) => {
     paymentPastDue:           lic.status === "past_due",
     pastDueGraceEndsAt:       pastDueGraceEndsAt(lic)
   });
+});
+
+// ---------------------------------------------------------------------------
+// Machines of a license (self-service: the key is the credential). The
+// panel's "Manage machines" dialog lists them; works for any existing
+// license, so an expired one can still tidy up its slots.
+// Input:  { licenseKey, fingerprint? }   (fingerprint = the caller, for `current`)
+// Output: { ok, machines: [{ id, fp, os, appVersion, firstSeenAt, lastSeenAt, current }], machinesUsed, machinesAllowed }
+// ---------------------------------------------------------------------------
+app.post("/v1/machines", async (c) => {
+  let body;
+  try { body = await c.req.json(); }
+  catch { return c.json({ error: "invalid JSON" }, 400); }
+  const licenseKey  = String(body.licenseKey  || "").trim().toUpperCase();
+  const fingerprint = String(body.fingerprint || "").trim();
+  if (!licenseKey) return c.json({ error: "licenseKey required" }, 400);
+  const db  = c.env.DB;
+  const lic = await findLicense(db, licenseKey);
+  if (!lic) return c.json({ error: "license not found" }, 404);
+  const machines = await listMachines(db, licenseKey, fingerprint);
+  return c.json({ ok: true, machines, machinesUsed: machines.length, machinesAllowed: lic.machines_allowed || 2 });
+});
+
+// ---------------------------------------------------------------------------
+// Release a machine slot. "Sign out" in the panel releases the calling
+// machine (fingerprint); the machine-limit dialog and "Manage machines"
+// release another one by its row id. Idempotent: an unknown machine is
+// reported as removed: 0.
+// Input:  { licenseKey, fingerprint?, machineId? }
+// Output: { ok, removed, machines, machinesUsed, machinesAllowed }
+// ---------------------------------------------------------------------------
+app.post("/v1/deactivate", async (c) => {
+  let body;
+  try { body = await c.req.json(); }
+  catch { return c.json({ error: "invalid JSON" }, 400); }
+  const licenseKey  = String(body.licenseKey  || "").trim().toUpperCase();
+  const fingerprint = String(body.fingerprint || "").trim();
+  const machineId   = body.machineId;
+  if (!licenseKey) return c.json({ error: "licenseKey required" }, 400);
+  if (!fingerprint && !(parseInt(machineId, 10) > 0)) return c.json({ error: "fingerprint or machineId required" }, 400);
+  const db  = c.env.DB;
+  const lic = await findLicense(db, licenseKey);
+  if (!lic) return c.json({ error: "license not found" }, 404);
+  const target = (parseInt(machineId, 10) > 0)
+    ? await findMachine(db, licenseKey, { machineId })
+    : await findMachine(db, licenseKey, { fingerprint });
+  let removed = 0;
+  if (target) {
+    await releaseMachine(db, licenseKey, target, { reason: "self_service", self: !!fingerprint && target.fingerprint === fingerprint, by: fingerprint.slice(0, 14) || null });
+    removed = 1;
+  }
+  const machines = await listMachines(db, licenseKey, fingerprint);
+  return c.json({ ok: true, removed, machines, machinesUsed: machines.length, machinesAllowed: lic.machines_allowed || 2 });
 });
 
 // ---------------------------------------------------------------------------
@@ -1553,7 +1671,7 @@ app.post("/v1/webhooks/lemon-squeezy", async (c) => {
     if (lsStatus === "on_trial") status = "trial";
     else if (lsStatus === "past_due") status = "past_due";
     else if (lsStatus === "cancelled") status = "cancelled";
-    else if (lsStatus === "expired") status = "expired";
+    else if (lsStatus === "expired" || lsStatus === "unpaid") status = "expired";   // unpaid = dunning exhausted, no access
 
     // expires_at = renews_at (next billing date — defines current paid period)
     const expiresAt = parseIsoMs(attrs.renews_at) || parseIsoMs(attrs.trial_ends_at) || (nowMs() + 30 * 24 * 60 * 60 * 1000);
@@ -1628,6 +1746,7 @@ app.post("/v1/webhooks/lemon-squeezy", async (c) => {
       lsStatus === "past_due" ? "past_due" :
       lsStatus === "cancelled" ? "cancelled" :
       lsStatus === "expired" ? "expired" :
+      lsStatus === "unpaid" ? "expired" :     // dunning exhausted: LS revoked access (a later payment_success reactivates)
       lsStatus === "active" ? "active" :
       null;
     const expiresAt = parseIsoMs(attrs.ends_at) || parseIsoMs(attrs.renews_at);
@@ -2055,6 +2174,73 @@ app.notFound((c) => c.json({ error: "not found", path: c.req.path }, 404));
 app.onError((err, c) => {
   console.error("Worker error:", err);
   return c.json({ error: err.message || "internal error" }, 500);
+});
+
+// ---------------------------------------------------------------------------
+// Admin: free a machine slot for a customer (support case "machine limit
+// reached" with a stale machine). The machine is addressed by row id, full
+// fingerprint or a unique fingerprint prefix (as shown by customer-detail).
+//   POST /v1/admin/remove-machine  { licenseKey, machineId? | fingerprint? }
+// ---------------------------------------------------------------------------
+app.post("/v1/admin/remove-machine", async (c) => {
+  const auth = c.req.header("Authorization") || "";
+  const expected = `Bearer ${c.env.ADMIN_TOKEN}`;
+  if (!c.env.ADMIN_TOKEN || auth !== expected) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  let body;
+  try { body = await c.req.json(); }
+  catch { return c.json({ error: "invalid JSON" }, 400); }
+  const licenseKey = String(body.licenseKey || "").trim().toUpperCase();
+  if (!licenseKey) return c.json({ error: "licenseKey required" }, 400);
+  const db  = c.env.DB;
+  const lic = await findLicense(db, licenseKey);
+  if (!lic) return c.json({ error: "license not found" }, 404);
+  const target = await findMachine(db, licenseKey, { machineId: body.machineId, fingerprint: body.fingerprint });
+  if (!target) {
+    const machines = await listMachines(db, licenseKey, "");
+    return c.json({ error: "machine not found (or prefix not unique)", machines }, 404);
+  }
+  await releaseMachine(db, licenseKey, target, { reason: "admin", by: "admin" });
+  const machines = await listMachines(db, licenseKey, "");
+  return c.json({ ok: true, removed: machineView(target, ""), machines, machinesUsed: machines.length, machinesAllowed: lic.machines_allowed || 2 });
+});
+
+// ---------------------------------------------------------------------------
+// Admin: correct a license status (used by admin-sync-unpaid.ps1 to retire
+// licenses whose Lemon Squeezy subscription went "unpaid" before the webhook
+// mapped that status). Logged like a webhook status change.
+//   POST /v1/admin/set-license-status  { licenseKey, status, reason? }
+// ---------------------------------------------------------------------------
+app.post("/v1/admin/set-license-status", async (c) => {
+  const auth = c.req.header("Authorization") || "";
+  const expected = `Bearer ${c.env.ADMIN_TOKEN}`;
+  if (!c.env.ADMIN_TOKEN || auth !== expected) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  let body;
+  try { body = await c.req.json(); }
+  catch { return c.json({ error: "invalid JSON" }, 400); }
+  const licenseKey = String(body.licenseKey || "").trim().toUpperCase();
+  const status     = String(body.status || "").trim().toLowerCase();
+  const reason     = String(body.reason || "").slice(0, 200);
+  const ALLOWED = ["active", "trial", "past_due", "cancelled", "expired"];
+  if (!licenseKey) return c.json({ error: "licenseKey required" }, 400);
+  if (!ALLOWED.includes(status)) return c.json({ error: "status must be one of " + ALLOWED.join(", ") }, 400);
+  const db  = c.env.DB;
+  const lic = await findLicense(db, licenseKey);
+  if (!lic) return c.json({ error: "license not found" }, 404);
+  if (lic.status === status) return c.json({ ok: true, changed: false, status });
+  await db.prepare(
+    "UPDATE licenses SET status = ?, past_due_since = CASE WHEN ? = 'past_due' THEN COALESCE(past_due_since, ?) ELSE NULL END, updated_at = ? WHERE key = ?"
+  ).bind(status, status, nowMs(), nowMs(), licenseKey).run();
+  const u = await db.prepare("SELECT email FROM users WHERE id = ?").bind(lic.user_id).first();
+  await logEvent(db, {
+    licenseKey, email: u ? u.email : null,
+    eventType:  "license_status_changed",
+    detail:     { from: lic.status, to: status, by: "admin", reason: reason || null }
+  });
+  return c.json({ ok: true, changed: true, from: lic.status, status });
 });
 
 export default app;
