@@ -198,6 +198,17 @@ const u3 = await wh("subscription_updated", 9003, { user_email: "orphan@example.
 const lic3 = sqlite.prepare("SELECT subscription_id, expires_at FROM licenses WHERE key = ?").get(mk3.json.licenseKey);
 assert(u3.status === 200 && lic3.subscription_id === "9003" && lic3.expires_at === Date.parse(renews2), "orphan license adopts the subscription id from a subscription event (self-heal kept)", lic3);
 
+console.log("\n=== (5b) webhook: test-mode events are ignored ===");
+const tm = await call("/v1/webhooks/lemon-squeezy", { meta: { event_name: "subscription_created", test_mode: true }, data: { id: "7001", attributes: { user_email: "testmode@example.com", customer_id: 1, variant_id: 1659298, status: "on_trial", renews_at: renews } } });
+const tmLic = sqlite.prepare("SELECT COUNT(*) AS n FROM licenses l JOIN users u ON u.id = l.user_id WHERE u.email = 'testmode@example.com'").get().n;
+const tmEv = events("webhook_rejected").filter((e) => e.detail && e.detail.reason === "test_mode");
+assert(tm.status === 200 && tm.json.ignored === "test_mode" && tmLic === 0 && tmEv.length === 1 && tmEv[0].email === "testmode@example.com" && tmEv[0].detail.variant_id === "1659298", "a test-mode subscription_created mints nothing and is logged as webhook_rejected/test_mode", { tm: tm.json, tmLic, tmEv });
+const tmU = await call("/v1/webhooks/lemon-squeezy", { meta: { event_name: "subscription_updated", test_mode: true }, data: { id: "9001", attributes: { user_email: "wh@example.com", variant_id: 1659438, status: "expired", renews_at: renews } } });
+const licAfterTm = sqlite.prepare("SELECT status FROM licenses WHERE key = ?").get(WKEY);
+assert(tmU.status === 200 && tmU.json.ignored === "test_mode" && licAfterTm.status === "active", "a test-mode subscription_updated never touches a live license", { tmU: tmU.json, licAfterTm });
+const live = await call("/v1/webhooks/lemon-squeezy", { meta: { event_name: "subscription_updated", test_mode: false }, data: { id: "9001", attributes: { user_email: "wh@example.com", variant_id: 1659438, status: "active", renews_at: renews } } });
+assert(live.status === 200 && !live.json.ignored, "meta.test_mode false is processed normally", live.json);
+
 console.log("\n=== (6) admin set-license-status ===");
 const s401 = await call("/v1/admin/set-license-status", { licenseKey: KEY, status: "expired" }, { Authorization: "Bearer nope" });
 assert(s401.status === 401, "set-license-status without admin token -> 401", s401.json);

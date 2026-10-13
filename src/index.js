@@ -1622,6 +1622,22 @@ app.post("/v1/webhooks/lemon-squeezy", async (c) => {
 
   const db = c.env.DB;
 
+  // Test-mode events (meta.test_mode) come from a test-mode checkout paid
+  // with a Stripe test card: no money, no customer. They must never mint or
+  // touch a license (2026-10-13: two "plan unknown" licenses came from such
+  // purchases via a test-mode checkout link in the wild). Logged so a test
+  // link that circulates is visible; 200 so LS does not retry.
+  if (payload.meta && payload.meta.test_mode === true) {
+    try {
+      await logEvent(db, {
+        eventType: "webhook_rejected",
+        email: String(attrs.user_email || "").toLowerCase().trim() || null,
+        detail: { reason: "test_mode", event_name: eventName, subscription_id: subId, variant_id: attrs.variant_id != null ? String(attrs.variant_id) : null }
+      });
+    } catch (eLog) {}
+    return c.json({ ok: true, ignored: "test_mode", event: eventName });
+  }
+
   // ----- Self-heal: link an orphan license to this subscription ------------
   // If a subscription lifecycle event (renewal / cancel / update / …) arrives
   // for a subscription_id we don't have on file, but the customer's email
